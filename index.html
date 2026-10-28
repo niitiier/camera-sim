@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Vision Sim – จำลองสิ่งที่กล้องมองเห็น</title>
+<style>
+:root{--bg:#121315;--fg:#e8e9ed;--mute:#8d9099;--blue:#3b82f6;--line:#34363b}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:"Sukhumvit Set","Thonburi",-apple-system,"Segoe UI",sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
+#view{position:fixed;inset:0;width:100%;height:100%}
+#pip{position:fixed;right:10px;top:calc(10px + env(safe-area-inset-top,0px));width:36vw;max-width:240px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#000}
+#pip video{display:block;width:100%}
+#pip canvas{position:absolute;inset:0;width:100%;height:100%}
+#hud{position:fixed;left:12px;top:calc(12px + env(safe-area-inset-top,0px));font-size:14px;line-height:1.5}
+#hud b{font-size:22px;font-weight:600;margin-right:4px}
+#hud .row{display:flex;gap:14px;align-items:baseline}
+#hud small{color:var(--mute);display:block;font-size:12px}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px));display:flex;gap:10px;align-items:center;background:linear-gradient(transparent,rgba(0,0,0,.65))}
+button{font:inherit;color:var(--fg);background:#2a2c31;border:1px solid var(--line);border-radius:999px;padding:9px 16px}
+button:active{background:#3a3d44}
+#cam{color:var(--mute);font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#set{position:fixed;left:12px;right:12px;bottom:calc(64px + env(safe-area-inset-bottom,0px));background:rgba(24,25,28,.94);border:1px solid var(--line);border-radius:14px;padding:12px 14px;display:none;font-size:13px}
+#set.on{display:block}
+#set label{display:grid;grid-template-columns:96px 1fr 48px;align-items:center;gap:8px;margin:6px 0}
+#set input{width:100%;accent-color:var(--blue)}
+#intro{position:fixed;inset:0;background:var(--bg);display:flex;flex-direction:column;justify-content:center;gap:16px;padding:28px;max-width:520px;margin:auto}
+#intro h1{margin:0;font-size:26px;font-weight:600;letter-spacing:-.01em}
+#intro p{margin:0;color:var(--mute);line-height:1.6;font-size:15px}
+#start{background:var(--blue);border-color:var(--blue);color:#fff;font-size:17px;padding:14px;border-radius:14px}
+#err{color:#f87171;font-size:14px;min-height:20px}
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="pip"><video id="v" playsinline muted autoplay></video><canvas id="ov"></canvas></div>
+<div id="hud"><div class="row"><span><b id="nP">0</b>คน</span><span><b id="nC">0</b>รถ</span><span><b id="nS">0</b>ป้าย/สัญญาณ</span></div><small id="info">–</small></div>
+<div id="set">
+  <label>เส้นขอบฟ้า<input id="sHz" type="range" min="25" max="65" value="42"><span id="vHz">42%</span></label>
+  <label>ความสูงกล้อง<input id="sCam" type="range" min="80" max="220" value="130"><span id="vCam">1.3 ม.</span></label>
+  <label>มุมกล้อง (ทแยง)<input id="sFov" type="range" min="70" max="130" value="120"><span id="vFov">120°</span></label>
+</div>
+<div id="bar"><button id="bSw">สลับกล้อง</button><button id="bSet">ปรับค่า</button><span id="cam"></span></div>
+
+<div id="intro">
+  <h1>Vision Sim</h1>
+  <p>ใช้กล้องหลัง (Ultra Wide ถ้ามี) ตรวจจับคน รถ เส้นถนน ไฟจราจร และป้ายหยุด แล้วแสดงเป็นภาพจำลอง 3 มิติแบบแดชบอร์ด ประมวลผลบนเครื่องทั้งหมด ไม่ส่งภาพออกไปไหน</p>
+  <p>วางมือถือแนวนอน ตั้งกล้องมองไปข้างหน้า แล้วปรับ "เส้นขอบฟ้า" ให้ตรงกับระดับขอบฟ้าในภาพ ระยะที่แสดงเป็นค่าประมาณเท่านั้น ห้ามใช้ตัดสินใจระหว่างขับรถ</p>
+  <div id="err"></div>
+  <button id="start">เริ่มใช้งาน</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const $=s=>document.querySelector(s);
+const view=$('#view'),vc=view.getContext('2d'),video=$('#v'),ov=$('#ov'),oc=ov.getContext('2d');
+const work=document.createElement('canvas'),wc=work.getContext('2d',{willReadFrequently:true});
+const crop=document.createElement('canvas'),cc=crop.getContext('2d',{willReadFrequently:true});
+const S={hz:.42,cam:1.3,fov:120};
+const CLS={person:'p',bicycle:'b',motorcycle:'m',car:'c',bus:'t',truck:'t','traffic light':'tl','stop sign':'ss'};
+const SIZE={c:[1.85,4.5,1.5],t:[2.5,9,3.2]};
+let model,stream,devices=[],devIdx=0,running=false,tracks=[],lanes={L:null,R:null,w:1,h:1,W:1,H:1,y0:0};
+let fps=0,lastT=performance.now(),hudT=0;
+
+/* ---------- camera ---------- */
+async function openCam(id){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  const base={width:{ideal:1280},height:{ideal:720}};
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:id?{...base,deviceId:{exact:id}}:{...base,facingMode:{ideal:'environment'}}});
+  video.srcObject=stream;await video.play();
+  if(!devices.length){
+    const all=await navigator.mediaDevices.enumerateDevices();
+    devices=all.filter(d=>d.kind==='videoinput'&&/back|rear|environment|ด้านหลัง/i.test(d.label));
+    const u=devices.findIndex(d=>/ultra/i.test(d.label));
+    if(u>=0){devIdx=u;return openCam(devices[u].deviceId)}
+  }
+  const lbl=stream.getVideoTracks()[0].label;$('#cam').textContent=lbl||'กล้อง';
+}
+$('#bSw').onclick=async()=>{if(devices.length<2)return;devIdx=(devIdx+1)%devices.length;lanes.L=lanes.R=null;tracks=[];try{await openCam(devices[devIdx].deviceId)}catch(e){}};
+$('#bSet').onclick=()=>$('#set').classList.toggle('on');
+for(const [id,key,f,fmt] of [['sHz','hz',v=>v/100,v=>v+'%'],['sCam','cam',v=>v/100,v=>(v/100).toFixed(1)+' ม.'],['sFov','fov',v=>+v,v=>v+'°']]){
+  $('#'+id).oninput=e=>{S[key]=f(e.target.value);$('#v'+id.slice(1)).textContent=fmt(e.target.value)};
+}
+$('#start').onclick=async()=>{
+  const b=$('#start');b.disabled=true;b.textContent='กำลังโหลดโมเดล…';$('#err').textContent='';
+  try{
+    model=await cocoSsd.load({base:'lite_mobilenet_v2'});
+    b.textContent='กำลังเปิดกล้อง…';await openCam();
+    try{await navigator.wakeLock.request('screen')}catch(e){}
+    $('#intro').style.display='none';running=true;loop();
+  }catch(e){
+    $('#err').textContent='เริ่มไม่สำเร็จ: '+(e.message||e)+' (ต้องเปิดผ่าน https และอนุญาตกล้อง)';
+    b.disabled=false;b.textContent='ลองอีกครั้ง';
+  }
+};
+
+/* ---------- geometry ---------- */
+function ground(px,py,W,H){
+  const f=Math.hypot(W,H)/2/Math.tan(S.fov*Math.PI/360),d=py-H*S.hz;
+  if(d<5)return null;
+  const Z=Math.min(80,f*S.cam/d);return{X:(px-W/2)*Z/f,Z};
+}
+function focal(W,H){return Math.hypot(W,H)/2/Math.tan(S.fov*Math.PI/360)}
+function toWorld(p,W,H){
+  const [x,y,w,h]=p.bbox,c=CLS[p.class],f=focal(W,H),cx=x+w/2,by=y+h;
+  let g=null,Z,X;
+  if(c==='tl'){Z=Math.min(80,f*.9/h);X=(cx-W/2)*Z/f}
+  else if(c==='ss'){Z=Math.min(80,f*.75/w);X=(cx-W/2)*Z/f}
+  else{
+    if(by<H*.97)g=ground(cx,by,W,H);
+    if(g){Z=g.Z;X=g.X}
+    else{const real=c==='p'?1.7:(SIZE[c]?SIZE[c][0]:1.8),dim=c==='p'?h:w;Z=Math.min(80,f*real/dim);X=(cx-W/2)*Z/f}
+  }
+  const o={c,X,Z,col:null};
+  if(c==='tl')o.col=lightColor(x,y,w,h);
+  return o;
+}
+function lightColor(x,y,w,h){
+  if(w<3||h<3)return null;
+  crop.width=12;crop.height=24;
+  try{cc.drawImage(video,x,y,w,h,0,0,12,24)}catch(e){return null}
+  const d=cc.getImageData(0,0,12,24).data;let r=0,g=0,yl=0;
+  for(let i=0;i<d.length;i+=4){
+    const R=d[i],G=d[i+1],B=d[i+2];
+    if(R>190&&R>G*1.7&&R>B*1.6)r++;
+    else if(R>190&&G>140&&B<130&&G>R*.55)yl++;
+    else if(G>150&&G>R*1.25&&B>R*.7)g++;
+  }
+  const m=Math.max(r,g,yl);if(m<2)return null;
+  return m===r?'r':m===g?'g':'y';
+}
+
+/* ---------- tracking ---------- */
+function updateTracks(objs){
+  tracks.forEach(t=>t.u=false);
+  for(const o of objs){
+    let best=null,bd=4;
+    for(const t of tracks){if(t.u||t.c!==o.c)continue;const d=Math.hypot(t.X-o.X,(t.Z-o.Z)*.5);if(d<bd){bd=d;best=t}}
+    if(best){best.X+=(o.X-best.X)*.35;best.Z+=(o.Z-best.Z)*.35;best.u=true;best.m=0;best.hits++;if(o.col)best.col=o.col}
+    else tracks.push({...o,u:true,m:0,hits:1});
+  }
+  tracks.forEach(t=>{if(!t.u)t.m++});
+  tracks=tracks.filter(t=>t.m<6);
+}
+
+/* ---------- lane detection (brightness + line fit) ---------- */
+function fit(P){
+  if(P.length<25)return null;
+  let a=0,b=0,pts=P;
+  for(let it=0;it<3;it++){
+    let sw=0,sy=0,sx=0,syy=0,sxy=0;
+    for(const [y,x,wt] of pts){sw+=wt;sy+=wt*y;sx+=wt*x;syy+=wt*y*y;sxy+=wt*y*x}
+    const den=sw*syy-sy*sy;if(Math.abs(den)<1e-6)return null;
+    a=(sw*sxy-sy*sx)/den;b=(sx-a*sy)/sw;
+    pts=P.filter(([y,x])=>Math.abs(a*y+b-x)<(it?3.5:10));
+    if(pts.length<20)return null;
+  }
+  return{a,b};
+}
+function upd(k,f){
+  const o=lanes[k];
+  if(f){if(o){o.a+=(f.a-o.a)*.3;o.b+=(f.b-o.b)*.3;o.miss=0}else lanes[k]={a:f.a,b:f.b,miss:0}}
+  else if(o&&++o.miss>10)lanes[k]=null;
+}
+function laneDetect(W,H){
+  const w=192,h=Math.round(w*H/W);work.width=w;work.height=h;
+  wc.drawImage(video,0,0,w,h);
+  const d=wc.getImageData(0,0,w,h).data,hy=Math.round(h*S.hz),y0=hy+Math.round((h-hy)*.1),y1=Math.round(h*.9);
+  Object.assign(lanes,{w,h,W,H,y0});
+  if(y1-y0<10)return;
+  const lum=new Float32Array(w*h);
+  for(let i=0;i<w*h;i++)lum[i]=.3*d[i*4]+.59*d[i*4+1]+.11*d[i*4+2];
+  const hist=new Uint32Array(256);let n=0;
+  for(let y=y0;y<y1;y++)for(let x=0;x<w;x++){hist[lum[y*w+x]|0]++;n++}
+  let acc=0,th=255;for(;th>0;th--){acc+=hist[th];if(acc>n*.05)break}
+  const L=[],R=[];
+  for(let y=y0;y<y1;y++)for(let x=4;x<w-4;x++){
+    const v=lum[y*w+x];
+    if(v<th||v<80)continue;
+    if(v-lum[y*w+x-4]<20&&v-lum[y*w+x+4]<20)continue;
+    const wt=1+(y-y0)/(y1-y0);
+    (x<w/2?L:R).push([y,x,wt]);
+  }
+  const ok=(f,sign)=>f&&f.a*sign>.2&&Math.abs(f.a*hy+f.b-w/2)<w*.25?f:null;
+  upd('L',ok(fit(L),-1));upd('R',ok(fit(R),1));
+}
+function laneRows(){
+  const rows=[];
+  if(!lanes.L&&!lanes.R)return rows;
+  for(let y=lanes.y0;y<lanes.h*.9;y+=3){
+    const r={};
+    for(const k of['L','R']){
+      const l=lanes[k];if(!l)continue;
+      const g=ground((l.a*y+l.b)*lanes.W/lanes.w,y*lanes.H/lanes.h,lanes.W,lanes.H);
+      if(g&&g.Z<50)r[k]=g;
+    }
+    if(r.L||r.R)rows.push(r);
+  }
+  return rows;
+}
+
+/* ---------- picture-in-picture overlay ---------- */
+function drawPip(preds,W,H){
+  oc.clearRect(0,0,W,H);oc.lineWidth=Math.max(2,W/320);oc.font=`${Math.round(W/36)}px sans-serif`;
+  for(const p of preds){
+    if(!CLS[p.class])continue;
+    oc.strokeStyle='#4ade80';oc.strokeRect(...p.bbox);
+    oc.fillStyle='#4ade80';oc.fillText(p.class,p.bbox[0]+3,p.bbox[1]-4);
+  }
+  oc.strokeStyle='#60a5fa';
+  for(const k of['L','R']){
+    const l=lanes[k];if(!l)continue;
+    oc.beginPath();
+    oc.moveTo(((l.a*lanes.y0+l.b)/lanes.w)*W,(lanes.y0/lanes.h)*H);
+    const ye=lanes.h*.9;oc.lineTo(((l.a*ye+l.b)/lanes.w)*W,(ye/lanes.h)*H);oc.stroke();
+  }
+  oc.strokeStyle='rgba(255,255,255,.35)';oc.beginPath();oc.moveTo(0,H*S.hz);oc.lineTo(W,H*S.hz);oc.stroke();
+}
+
+/* ---------- main loop ---------- */
+async function loop(){
+  if(!running)return;
+  if(video.readyState>=2&&video.videoWidth){
+    const W=video.videoWidth,H=video.videoHeight;
+    if(ov.width!==W||ov.height!==H){ov.width=W;ov.height=H}
+    let preds=[];
+    try{preds=await model.detect(video,25,.4)}catch(e){}
+    updateTracks(preds.filter(p=>CLS[p.class]).map(p=>toWorld(p,W,H)));
+    laneDetect(W,H);drawPip(preds,W,H);
+  }
+  render();
+  const t=performance.now();fps=fps*.9+(1000/(t-lastT))*.1;lastT=t;
+  if(t-hudT>300){hudT=t;hud()}
+  requestAnimationFrame(loop);
+}
+function hud(){
+  const v=tracks.filter(t=>t.hits>=2&&t.m<3);
+  $('#nP').textContent=v.filter(t=>'pbm'.includes(t.c)).length;
+  $('#nC').textContent=v.filter(t=>t.c==='c'||t.c==='t').length;
+  $('#nS').textContent=v.filter(t=>t.c==='tl'||t.c==='ss').length;
+  $('#info').textContent=`เส้นถนน ${lanes.L?'ซ้าย ':''}${lanes.R?'ขวา':''}${!lanes.L&&!lanes.R?'ไม่พบ':''} · ${fps.toFixed(0)} เฟรม/วิ`;
+}
+
+/* ---------- Tesla-style renderer ---------- */
+function render(){
+  const dpr=Math.min(devicePixelRatio||1,2),W=Math.round(view.clientWidth*dpr),H=Math.round(view.clientHeight*dpr);
+  if(view.width!==W||view.height!==H){view.width=W;view.height=H}
+  const hz=H*.3,F=W*(W>H?.6:1),hC=5,back=7;
+  const P=(X,Z)=>{const zc=Z+back;return{x:W/2+F*X/zc,y:hz+F*hC/zc,s:F/zc}};
+  const fade=Z=>Math.max(.3,Math.min(1,1.25-Z/60));
+  const rr=(x,y,w,h,r)=>{vc.beginPath();vc.roundRect(x,y,w,h,r);vc.fill()};
+
+  let g=vc.createLinearGradient(0,0,0,H);g.addColorStop(0,'#141517');g.addColorStop(.3,'#2a2b2f');g.addColorStop(1,'#18191b');
+  vc.fillStyle=g;vc.fillRect(0,0,W,H);
+  const e=P(0,0);
+  g=vc.createRadialGradient(e.x,e.y,10,e.x,e.y,W*.75);g.addColorStop(0,'rgba(205,206,212,.38)');g.addColorStop(1,'rgba(205,206,212,0)');
+  vc.fillStyle=g;vc.fillRect(0,hz,W,H-hz);
+
+  const rows=laneRows();
+  // road surface
+  const both=rows.filter(r=>r.L&&r.R);
+  if(both.length>1){
+    vc.beginPath();
+    both.forEach((r,i)=>{const p=P(r.L.X,r.L.Z);i?vc.lineTo(p.x,p.y):vc.moveTo(p.x,p.y)});
+    for(let i=both.length-1;i>=0;i--){const p=P(both[i].R.X,both[i].R.Z);vc.lineTo(p.x,p.y)}
+    vc.closePath();vc.fillStyle='rgba(15,16,18,.55)';vc.fill();
+  }
+  // lane lines
+  vc.lineCap='round';
+  for(const k of['L','R']){
+    const pts=rows.filter(r=>r[k]).map(r=>r[k]);
+    for(let i=1;i<pts.length;i++){
+      const a=P(pts[i-1].X,pts[i-1].Z),b=P(pts[i].X,pts[i].Z);
+      vc.strokeStyle=`rgba(238,239,243,${fade(pts[i].Z)*.9})`;vc.lineWidth=Math.max(1.5,.14*b.s);
+      vc.beginPath();vc.moveTo(a.x,a.y);vc.lineTo(b.x,b.y);vc.stroke();
+    }
+  }
+  // planned path
+  const path=[];
+  if(both.length>1)both.forEach(r=>path.push({X:(r.L.X+r.R.X)/2,Z:r.L.Z}));
+  else for(let z=2;z<=34;z+=2)path.push({X:0,Z:z});
+  path.sort((a,b)=>b.Z-a.Z);
+  for(let i=1;i<path.length;i++){
+    const a=P(path[i-1].X,path[i-1].Z),b=P(path[i].X,path[i].Z);
+    vc.strokeStyle=`rgba(59,130,246,${fade(path[i].Z)})`;vc.lineWidth=Math.max(2,.3*b.s);
+    vc.beginPath();vc.moveTo(a.x,a.y);vc.lineTo(b.x,b.y);vc.stroke();
+  }
+
+  // objects, far to near
+  const list=tracks.filter(t=>t.hits>=2&&t.m<3).sort((a,b)=>b.Z-a.Z);
+  const car=(X,Z,w,l,ht,top,rear,alpha)=>{
+    const n=P(X,Z-l/2),f=P(X,Z+l/2),topN=n.y-ht*n.s,topF=f.y-ht*f.s;
+    vc.globalAlpha=alpha;
+    vc.fillStyle='rgba(0,0,0,.35)';vc.beginPath();vc.ellipse(n.x,(n.y+f.y)/2,w*n.s*.6,(n.y-f.y)*.55+4,0,0,7);vc.fill();
+    vc.fillStyle=top;vc.beginPath();
+    vc.moveTo(n.x-w/2*n.s,topN);vc.lineTo(n.x+w/2*n.s,topN);vc.lineTo(f.x+w/2*f.s,topF);vc.lineTo(f.x-w/2*f.s,topF);vc.closePath();vc.fill();
+    vc.fillStyle=rear;rr(n.x-w/2*n.s,topN,w*n.s,ht*n.s,n.s*.18);
+    vc.globalAlpha=1;return{n,topN};
+  };
+  const person=(X,Z,k,lift,alpha)=>{
+    const p=P(X,Z),s=p.s*k,y=p.y-lift*p.s;
+    vc.globalAlpha=alpha;
+    vc.fillStyle='rgba(0,0,0,.3)';vc.beginPath();vc.ellipse(p.x,p.y,.3*s,.08*s,0,0,7);vc.fill();
+    vc.fillStyle='rgba(236,237,242,.93)';
+    rr(y>0?p.x-.2*s:0,y-.85*s,.17*s,.85*s,.06*s);rr(p.x+.03*s,y-.85*s,.17*s,.85*s,.06*s);
+    rr(p.x-.26*s,y-1.5*s,.52*s,.72*s,.16*s);
+    vc.beginPath();vc.arc(p.x,y-1.66*s,.12*s,0,7);vc.fill();
+    vc.globalAlpha=1;
+  };
+  for(const t of list){
+    const al=fade(t.Z);
+    if(t.c==='p')person(t.X,t.Z,1,0,al);
+    else if(t.c==='b'||t.c==='m'){
+      const p=P(t.X,t.Z);vc.globalAlpha=al;vc.strokeStyle='rgba(236,237,242,.9)';vc.lineWidth=Math.max(1.5,.07*p.s);
+      vc.beginPath();vc.ellipse(p.x,p.y-.33*p.s,.07*p.s,.33*p.s,0,0,7);vc.stroke();vc.globalAlpha=1;
+      person(t.X,t.Z,.85,.3,al);
+    }else if(t.c==='c'||t.c==='t'){
+      const[w,l,h]=SIZE[t.c];
+      const r=car(t.X,t.Z,w,l,h,'#e6e7ea','#b4b5ba',al);
+      vc.globalAlpha=al;vc.fillStyle='rgba(120,122,128,.55)';rr(r.n.x-w*.38*r.n.s,r.topN+h*.12*r.n.s,w*.76*r.n.s,h*.22*r.n.s,r.n.s*.05);vc.globalAlpha=1;
+    }else if(t.c==='tl'){
+      const p=P(t.X,t.Z),s=p.s,top=p.y-5*s;
+      vc.globalAlpha=al;vc.strokeStyle='rgba(255,255,255,.25)';vc.lineWidth=Math.max(1,.07*s);
+      vc.beginPath();vc.moveTo(p.x,p.y);vc.lineTo(p.x,top);vc.stroke();
+      vc.fillStyle='#26272b';rr(p.x-.2*s,top-1*s,.4*s,1*s,.08*s);
+      [['r','#ef4444'],['y','#facc15'],['g','#22c55e']].forEach(([k,c],i)=>{
+        vc.fillStyle=t.col===k?c:'#4a4c52';vc.beginPath();vc.arc(p.x,top-.8*s+i*.3*s,.11*s,0,7);vc.fill();
+      });
+      vc.globalAlpha=1;
+    }else if(t.c==='ss'){
+      const p=P(t.X,t.Z),s=p.s,cy=p.y-2.3*s,r=.45*s;
+      vc.globalAlpha=al;vc.strokeStyle='rgba(255,255,255,.25)';vc.lineWidth=Math.max(1,.07*s);
+      vc.beginPath();vc.moveTo(p.x,p.y);vc.lineTo(p.x,cy);vc.stroke();
+      vc.fillStyle='#dc2626';vc.beginPath();
+      for(let i=0;i<8;i++){const a=Math.PI/8+i*Math.PI/4;vc.lineTo(p.x+r*Math.cos(a),cy+r*Math.sin(a))}
+      vc.closePath();vc.fill();
+      if(s>22){vc.fillStyle='#fff';vc.font=`bold ${.2*s}px sans-serif`;vc.textAlign='center';vc.fillText('STOP',p.x,cy+.07*s);vc.textAlign='start'}
+      vc.globalAlpha=1;
+    }
+  }
+  // ego car (drawn last, in front)
+  const ego=car(0,0,1.9,4.6,1.35,'#8c8e96','#3b3d43',1);
+  vc.fillStyle='#ef4444';rr(ego.n.x-.85*ego.n.s,ego.topN+.28*ego.n.s,.5*ego.n.s,.1*ego.n.s,2);rr(ego.n.x+.35*ego.n.s,ego.topN+.28*ego.n.s,.5*ego.n.s,.1*ego.n.s,2);
+}
+</script>
+</body>
+</html>
